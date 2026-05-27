@@ -1,6 +1,6 @@
 require('dotenv').config()
 const express = require('express')
-const mysql = require('mysql2')
+const mysql = require('mysql2/promise')
 const cors = require('cors')
 const axios = require('axios')
 const jwt = require('jsonwebtoken')
@@ -18,19 +18,15 @@ const TWITCH_CLIENT_ID =
 const TWITCH_CLIENT_SECRET =
 	process.env.TWITCH_CLIENT_SECRET || 'mxw55kxt62hqryzpext6dw9zn3mf4w'
 
-const db = mysql.createConnection({
+const pool = mysql.createPool({
 	host: process.env.DB_HOST,
 	user: process.env.DB_USER,
 	password: process.env.DB_PASSWORD,
 	database: process.env.DB_NAME,
-})
-
-db.connect(err => {
-	if (err) {
-		console.error('Ошибка подключения к БД:', err.message)
-		return
-	}
-	console.log('--- Успешно подключено к mcsr_hub ---')
+	port: process.env.DB_PORT || 3306,
+	waitForConnections: true,
+	connectionLimit: 10,
+	queueLimit: 0,
 })
 
 // Middleware
@@ -87,7 +83,7 @@ app.post('/api/auth/register', async (req, res) => {
 		const hashedPassword = await bcrypt.hash(password, 10)
 		const sql =
 			'INSERT INTO users (username, email, password, flag, points) VALUES (?, ?, ?, ?, 1000)'
-		db.query(sql, [username, email, hashedPassword, flag], err => {
+		pool.query(sql, [username, email, hashedPassword, flag], err => {
 			if (err) return res.status(500).json({ error: 'Ошибка регистрации' })
 			res.json({ message: 'Регистрация успешна' })
 		})
@@ -98,7 +94,7 @@ app.post('/api/auth/register', async (req, res) => {
 
 app.post('/api/auth/login', (req, res) => {
 	const { username, password } = req.body
-	db.query(
+	pool.query(
 		'SELECT * FROM users WHERE username = ?',
 		[username],
 		async (err, results) => {
@@ -172,7 +168,7 @@ app.post('/api/streams/check', async (req, res) => {
 // === API ТУРНИРОВ ===
 app.get('/api/tournaments', (req, res) => {
 	const sql = 'SELECT * FROM tournaments ORDER BY created_at DESC'
-	db.query(sql, (err, results) => {
+	pool.query(sql, (err, results) => {
 		if (err) return res.status(500).json({ error: err.message })
 		res.json(results)
 	})
@@ -181,7 +177,7 @@ app.get('/api/tournaments', (req, res) => {
 app.get('/api/tournaments/:id', (req, res) => {
 	const { id } = req.params
 	const sql = 'SELECT * FROM tournaments WHERE id = ?'
-	db.query(sql, [id], (err, results) => {
+	pool.query(sql, [id], (err, results) => {
 		if (err) return res.status(500).json({ error: err.message })
 		if (results.length === 0)
 			return res.status(404).json({ message: 'Турнир не найден' })
@@ -198,7 +194,7 @@ app.get('/api/tournaments/:id/matches', (req, res) => {
         WHERE m.tournament_id = ?
         ORDER BY m.match_date DESC
     `
-	db.query(sql, [id], (err, results) => {
+	pool.query(sql, [id], (err, results) => {
 		if (err) return res.status(500).json({ error: err.message })
 		res.json(results)
 	})
@@ -218,7 +214,7 @@ app.post('/api/tournaments', isAdmin, (req, res) => {
 	const sql = `INSERT INTO tournaments 
         (title, status, description, image_url, start_date, end_date, prize_pool, player_count) 
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-	db.query(
+	pool.query(
 		sql,
 		[
 			title,
@@ -241,7 +237,7 @@ app.put('/api/tournaments/:id', isAdmin, (req, res) => {
 	const { id } = req.params
 	const d = req.body
 	const sql = `UPDATE tournaments SET title = ?, status = ?, description = ?, image_url = ?, start_date = ?, end_date = ?, prize_pool = ?, player_count = ? WHERE id = ?`
-	db.query(
+	pool.query(
 		sql,
 		[
 			d.title,
@@ -266,10 +262,10 @@ app.put('/api/tournaments/:id', isAdmin, (req, res) => {
 app.delete('/api/tournaments/:id', isAdmin, (req, res) => {
 	const { id } = req.params
 	const deleteMatchesSql = 'DELETE FROM matches WHERE tournament_id = ?'
-	db.query(deleteMatchesSql, [id], err => {
+	pool.query(deleteMatchesSql, [id], err => {
 		if (err) return res.status(500).json({ error: 'Не удалось удалить матчи' })
 		const deleteTournamentSql = 'DELETE FROM tournaments WHERE id = ?'
-		db.query(deleteTournamentSql, [id], (err, result) => {
+		pool.query(deleteTournamentSql, [id], (err, result) => {
 			if (err)
 				return res.status(500).json({ error: 'Не удалось удалить турнир' })
 			res.json({ message: 'Турнир и матчи удалены' })
@@ -277,18 +273,21 @@ app.delete('/api/tournaments/:id', isAdmin, (req, res) => {
 	})
 })
 // === API МАТЧЕЙ ===
-app.get('/api/matches', (req, res) => {
-	const sql = `SELECT m.*, t.title as tournament_name FROM matches m LEFT JOIN tournaments t ON m.tournament_id = t.id ORDER BY m.match_date DESC`
-	db.query(sql, (err, results) => {
-		if (err) return res.status(500).json({ error: err.message })
+app.get('/api/matches', async (req, res) => {
+	// 1. Добавляем async
+	try {
+		const sql = `SELECT ...`
+		const [results] = await pool.query(sql) // 2. Используем await (деструктуризация [results])
 		res.json(results)
-	})
+	} catch (err) {
+		res.status(500).json({ error: err.message })
+	}
 })
 
 app.get('/api/matches/:id', (req, res) => {
 	const { id } = req.params
 	const sql = `SELECT m.*, t.title as tournament_name FROM matches m LEFT JOIN tournaments t ON m.tournament_id = t.id WHERE m.id = ?`
-	db.query(sql, [id], (err, results) => {
+	pool.query(sql, [id], (err, results) => {
 		if (err) return res.status(500).json({ error: err.message })
 		if (results.length === 0)
 			return res.status(404).json({ message: 'Матч не найден' })
@@ -331,7 +330,7 @@ app.post('/api/matches', isAdmin, async (req, res) => {
 			p2.winRate,
 			p2.totalMatches,
 		]
-		db.query(sql, params, (err, result) => {
+		pool.query(sql, params, (err, result) => {
 			if (err) return res.status(500).json({ error: err.message })
 			res.json({ id: result.insertId, message: 'Матч создан' })
 		})
@@ -377,7 +376,7 @@ app.put('/api/matches/:id', isAdmin, async (req, res) => {
 			p2.totalMatches,
 			id,
 		]
-		db.query(sql, params, (err, result) => {
+		pool.query(sql, params, (err, result) => {
 			if (err) return res.status(500).json({ error: err.message })
 			if (result.affectedRows === 0)
 				return res.status(404).json({ message: 'Матч не найден' })
@@ -390,7 +389,7 @@ app.put('/api/matches/:id', isAdmin, async (req, res) => {
 
 app.delete('/api/matches/:id', isAdmin, (req, res) => {
 	const { id } = req.params
-	db.query('DELETE FROM matches WHERE id = ?', [id], err => {
+	pool.query('DELETE FROM matches WHERE id = ?', [id], err => {
 		if (err) return res.status(500).json({ error: err.message })
 		res.json({ message: 'Матч удален' })
 	})
@@ -399,7 +398,7 @@ app.delete('/api/matches/:id', isAdmin, (req, res) => {
 app.patch('/api/matches/:id/score', isAdmin, (req, res) => {
 	const { id } = req.params
 	const { score1, score2 } = req.body
-	db.query(
+	pool.query(
 		'UPDATE matches SET score1 = ?, score2 = ? WHERE id = ?',
 		[score1 || 0, score2 || 0, id],
 		(err, result) => {
@@ -414,7 +413,7 @@ app.post('/api/picks', authenticateToken, async (req, res) => {
 	const userId = req.user.id
 	const { tournamentId, matchId, predictedWinnerId } = req.body
 	const sql = `INSERT INTO picks (user_id, tournament_id, match_id, predicted_winner_id) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE predicted_winner_id = VALUES(predicted_winner_id)`
-	db.query(sql, [userId, tournamentId, matchId, predictedWinnerId], err => {
+	pool.query(sql, [userId, tournamentId, matchId, predictedWinnerId], err => {
 		if (err) return res.status(500).json({ error: err.message })
 		res.json({ message: 'Прогноз сохранен' })
 	})
@@ -426,7 +425,7 @@ app.get('/api/picks/:tournamentId', authenticateToken, (req, res) => {
 	// ВАЖНОЕ ИЗМЕНЕНИЕ: Добавлены 'AS matchId' и 'AS predictedWinnerId'.
 	// Это необходимо, чтобы Vue фронтенд (настроенный на camelCase)
 	// смог правильно распарсить данные.
-	db.query(
+	pool.query(
 		'SELECT match_id AS matchId, predicted_winner_id AS predictedWinnerId FROM picks WHERE tournament_id = ? AND user_id = ?',
 		[tournamentId, req.user.id],
 		(err, results) => {
@@ -521,7 +520,7 @@ app.get('/api/ranked/top-streams', async (req, res) => {
 
 // Получение статистики (доступно всем)
 app.get('/api/stats', (req, res) => {
-	db.query(
+	pool.query(
 		'SELECT * FROM ranked_stats ORDER BY rank_pos ASC',
 		(err, results) => {
 			if (err) return res.status(500).json({ error: err.message })
@@ -544,7 +543,7 @@ app.post('/api/stats/sync', isAdmin, async (req, res) => {
 		}
 
 		// 2. Очищаем старую таблицу
-		db.query('TRUNCATE TABLE ranked_stats', err => {
+		pool.query('TRUNCATE TABLE ranked_stats', err => {
 			if (err)
 				return res
 					.status(500)
@@ -563,7 +562,7 @@ app.post('/api/stats/sync', isAdmin, async (req, res) => {
 				p.country,
 			])
 
-			db.query(sql, [values], err => {
+			pool.query(sql, [values], err => {
 				if (err)
 					return res
 						.status(500)
